@@ -53,14 +53,15 @@ app = FastAPI()
 # ============================================
 
 # Application health status (1 = up, 0 = down)
-app_up = Gauge('app_up', 'Application is running (1 = up, 0 = down)')
-app_up.set(1)  # Set to 1 when app starts
+# This is used by alert: NHITRAMSAPIDown
+up = Gauge('up', 'Application is running (1 = up, 0 = down)', ['job'])
+up.labels(job='NHIT_RAMS_api_health').set(1)  # Set to 1 when app starts
 
 # Application info
 app_info = Info('app_info', 'Application information')
 app_info.info({
     'version': '1.0.0',
-    'name': 'Railway Distress Analysis API'
+    'name': 'NHIT_RAMS API'
 })
 
 # HTTP request metrics
@@ -70,10 +71,12 @@ http_requests_total = Counter(
     ['method', 'endpoint', 'status']
 )
 
+# HTTP request duration - MUST be Histogram with buckets for alert: NHITRAMSHighLatency
 http_request_duration_seconds = Histogram(
     'http_request_duration_seconds',
     'HTTP request duration in seconds',
-    ['method', 'endpoint']
+    ['method', 'endpoint'],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0)
 )
 
 # Image processing metrics
@@ -115,6 +118,53 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+# ============================================
+# MIDDLEWARE TO TRACK ALL HTTP REQUESTS
+# ============================================
+@app.middleware("http")
+async def prometheus_middleware(request, call_next):
+    """Track all HTTP requests for Prometheus metrics"""
+    # Skip metrics endpoint itself
+    if request.url.path == "/metrics":
+        return await call_next(request)
+    
+    start_time = time.time()
+    
+    try:
+        response = await call_next(request)
+        
+        # Record metrics
+        duration = time.time() - start_time
+        http_request_duration_seconds.labels(
+            method=request.method,
+            endpoint=request.url.path
+        ).observe(duration)
+        
+        http_requests_total.labels(
+            method=request.method,
+            endpoint=request.url.path,
+            status=str(response.status_code)
+        ).inc()
+        
+        return response
+        
+    except Exception as e:
+        # Record error
+        duration = time.time() - start_time
+        http_request_duration_seconds.labels(
+            method=request.method,
+            endpoint=request.url.path
+        ).observe(duration)
+        
+        http_requests_total.labels(
+            method=request.method,
+            endpoint=request.url.path,
+            status="500"
+        ).inc()
+        
+        errors_total.labels(error_type='middleware_exception').inc()
+        raise
 
 # === CONFIG ===
 CLIENT_ID = os.getenv("CLIENT_ID")
@@ -734,13 +784,14 @@ async def on_startup():
     scheduler.start()
     schedule_operations()
     
-    # Update metrics
-    app_up.set(1)
+    # Update metrics - Set up=1 for health check
+    up.labels(job='NHIT_RAMS_api_health').set(1)
     scheduled_jobs_active.set(len(scheduler.get_jobs()))
 
 @app.on_event("shutdown")
 def on_shutdown():
-    app_up.set(0)  # Mark app as down
+    # Mark app as down when shutting down
+    up.labels(job='NHIT_RAMS_api_health').set(0)
     scheduler.shutdown()
 
 # ============================================
@@ -1604,7 +1655,6 @@ def append_inventory_excel(record: InventoryRecord):
 async def process_image(file: UploadFile = File(...)):
  
     global SESSION_MAIN_EXCEL, SESSION_MAIN_NAME
-    start_time = time.time()
  
     try:
         fname = file.filename
@@ -1641,11 +1691,6 @@ async def process_image(file: UploadFile = File(...)):
                 "total_length_m": float(cls_df["Length(M)"].sum()),
                 "total_width_mm": float(cls_df["Width(MM)"].sum())
             }
-        
-        # Track metrics
-        duration = time.time() - start_time
-        http_request_duration_seconds.labels(method='POST', endpoint='/process_image').observe(duration)
-        http_requests_total.labels(method='POST', endpoint='/process_image', status='200').inc()
  
         return {
             "status": "success",
@@ -1656,7 +1701,6 @@ async def process_image(file: UploadFile = File(...)):
  
     except Exception as e:
         errors_total.labels(error_type='process_image_error').inc()
-        http_requests_total.labels(method='POST', endpoint='/process_image', status='500').inc()
         return {"status": "error", "message": str(e)}
  
  
