@@ -2,13 +2,19 @@
 
 ## Metrics Added
 
-### 1. HTTP Request Counter
+### 1. UP Metric (For API Down Alert)
+- **Metric**: `up{job="NHIT_RAMS_api_health"}`
+- **Type**: Gauge
+- **Values**: 1 (up) or 0 (down)
+- **Description**: Service health status
+
+### 2. HTTP Request Counter
 - **Metric**: `http_requests_total`
 - **Type**: Counter
 - **Labels**: method, endpoint, status
 - **Description**: Total number of HTTP requests
 
-### 2. HTTP Request Latency
+### 3. HTTP Request Latency (For High Latency Alert)
 - **Metric**: `http_request_duration_seconds`
 - **Type**: Histogram
 - **Labels**: endpoint
@@ -26,6 +32,10 @@ curl https://your-app.railway.app/metrics
 
 **Output:**
 ```
+# HELP up Service is up (1) or down (0)
+# TYPE up gauge
+up{job="NHIT_RAMS_api_health"} 1.0
+
 # HELP http_requests_total Total HTTP Requests
 # TYPE http_requests_total counter
 http_requests_total{endpoint="/health",method="GET",status="200"} 5.0
@@ -34,6 +44,7 @@ http_requests_total{endpoint="/health",method="GET",status="200"} 5.0
 # TYPE http_request_duration_seconds histogram
 http_request_duration_seconds_bucket{endpoint="/health",le="0.005"} 3.0
 http_request_duration_seconds_bucket{endpoint="/health",le="0.01"} 5.0
+http_request_duration_seconds_bucket{endpoint="/health",le="2.5"} 5.0
 http_request_duration_seconds_sum{endpoint="/health"} 0.025
 http_request_duration_seconds_count{endpoint="/health"} 5.0
 ```

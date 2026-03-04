@@ -65,6 +65,11 @@ REQUEST_LATENCY = Histogram(
     ["endpoint"]
 )
 
+# UP metric for health monitoring (required for NHITRAMSAPIDown alert)
+from prometheus_client import Gauge
+UP_METRIC = Gauge('up', 'Service is up (1) or down (0)', ['job'])
+UP_METRIC.labels(job='NHIT_RAMS_api_health').set(1)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -710,9 +715,14 @@ async def on_startup():
     )
     scheduler.start()
     schedule_operations()
+    
+    # Set UP metric to 1 (service is healthy)
+    UP_METRIC.labels(job='NHIT_RAMS_api_health').set(1)
 
 @app.on_event("shutdown")
 def on_shutdown():
+    # Set UP metric to 0 (service is down)
+    UP_METRIC.labels(job='NHIT_RAMS_api_health').set(0)
     scheduler.shutdown()
 
 # ------------------------------
