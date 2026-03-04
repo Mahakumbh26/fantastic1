@@ -1,0 +1,12 @@
+services:
+  fastapi-app:
+    build: .
+    ports:
+      - "8000:8000"
+    restart: always
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge

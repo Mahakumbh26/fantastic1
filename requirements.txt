@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+gunicorn
+pandas
+apscheduler
+numpy
+starlette
+pydantic
+pydantic-settings
+python-crontab
+requests
+openpyxl
+python-multipart==0.0.9
+opencv-python-headless==4.10.0.84
+prometheus-client
+prometheus-fastapi-instrumentator
