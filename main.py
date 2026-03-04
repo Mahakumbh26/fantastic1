@@ -18,8 +18,9 @@ import numpy as np
 import collections,cv2
 import html
 from fastapi.concurrency import run_in_threadpool
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST, REGISTRY
 from prometheus_fastapi_instrumentator import Instrumentator
+from starlette.responses import Response
  
 
 class Settings(BaseSettings):
@@ -724,7 +725,7 @@ async def on_startup():
     schedule_operations()
     
     # Expose metrics endpoint
-    instrumentator.expose(app, endpoint="/metrics")
+    instrumentator.expose(app)
     
     # Update active jobs gauge
     ACTIVE_JOBS.set(len(scheduler.get_jobs()))
@@ -732,6 +733,20 @@ async def on_startup():
 @app.on_event("shutdown")
 def on_shutdown():
     scheduler.shutdown()
+
+# Health check endpoint for Railway
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "scheduler_running": scheduler.running,
+        "active_jobs": len(scheduler.get_jobs())
+    }
+
+# Manual metrics endpoint (backup)
+@app.get("/metrics")
+async def metrics():
+    return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
 # Pydantic models
 class BaseFilter(BaseModel):
