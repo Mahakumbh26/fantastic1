@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends, Query,Path, UploadFile, File
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -18,7 +18,9 @@ import numpy as np
 import collections,cv2
 import html
 from fastapi.concurrency import run_in_threadpool
-from prometheus_client import Counter, Histogram, Gauge, Info, generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry, REGISTRY
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from fastapi import Request
+from fastapi.responses import Response
  
 
 class Settings(BaseSettings):
@@ -48,73 +50,20 @@ settings = Settings()
 
 app = FastAPI()
 
-# ============================================
-# PROMETHEUS METRICS FOR RAILWAY
-# ============================================
-
-# Application health status (1 = up, 0 = down)
-# This is used by alert: NHITRAMSAPIDown
-up = Gauge('up', 'Application is running (1 = up, 0 = down)', ['job'])
-
-# Application info
-app_info = Info('app_info', 'Application information')
-app_info.info({
-    'version': '1.0.0',
-    'name': 'NHIT_RAMS API'
-})
-
-# HTTP request metrics
-http_requests_total = Counter(
-    'http_requests_total',
-    'Total HTTP requests',
-    ['method', 'endpoint', 'status']
+# ------------------------------
+# Prometheus Metrics
+# ------------------------------
+REQUEST_COUNT = Counter(
+    "http_requests_total",
+    "Total HTTP Requests",
+    ["method", "endpoint", "status"]
 )
 
-# HTTP request duration - MUST be Histogram with buckets for alert: NHITRAMSHighLatency
-http_request_duration_seconds = Histogram(
-    'http_request_duration_seconds',
-    'HTTP request duration in seconds',
-    ['method', 'endpoint'],
-    buckets=(0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0)
+REQUEST_LATENCY = Histogram(
+    "http_request_duration_seconds",
+    "Request latency",
+    ["endpoint"]
 )
-
-# Image processing metrics
-images_processed_total = Counter(
-    'images_processed_total',
-    'Total number of images processed',
-    ['operation_type']
-)
-
-# Excel operations metrics
-excel_operations_total = Counter(
-    'excel_operations_total',
-    'Total Excel operations',
-    ['operation']
-)
-
-# Scheduler metrics
-scheduled_jobs_active = Gauge(
-    'scheduled_jobs_active',
-    'Number of active scheduled jobs'
-)
-
-# Cache metrics
-cache_entries = Gauge(
-    'cache_entries',
-    'Number of entries in cache',
-    ['cache_type']
-)
-
-# Error metrics
-errors_total = Counter(
-    'errors_total',
-    'Total number of errors',
-    ['error_type']
-)
-
-# Initialize metrics immediately (so they appear in /metrics even before first request)
-up.labels(job='NHIT_RAMS_api_health').set(1)
-scheduled_jobs_active.set(0)  # Will be updated on startup
 
 app.add_middleware(
     CORSMiddleware,
@@ -122,52 +71,27 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# ============================================
-# MIDDLEWARE TO TRACK ALL HTTP REQUESTS
-# ============================================
+# ------------------------------
+# Prometheus Middleware
+# ------------------------------
 @app.middleware("http")
-async def prometheus_middleware(request, call_next):
-    """Track all HTTP requests for Prometheus metrics"""
-    # Skip metrics endpoint itself
-    if request.url.path == "/metrics":
-        return await call_next(request)
-    
+async def prometheus_middleware(request: Request, call_next):
     start_time = time.time()
-    
-    try:
-        response = await call_next(request)
-        
-        # Record metrics
-        duration = time.time() - start_time
-        http_request_duration_seconds.labels(
-            method=request.method,
-            endpoint=request.url.path
-        ).observe(duration)
-        
-        http_requests_total.labels(
-            method=request.method,
-            endpoint=request.url.path,
-            status=str(response.status_code)
-        ).inc()
-        
-        return response
-        
-    except Exception as e:
-        # Record error
-        duration = time.time() - start_time
-        http_request_duration_seconds.labels(
-            method=request.method,
-            endpoint=request.url.path
-        ).observe(duration)
-        
-        http_requests_total.labels(
-            method=request.method,
-            endpoint=request.url.path,
-            status="500"
-        ).inc()
-        
-        errors_total.labels(error_type='middleware_exception').inc()
-        raise
+
+    response = await call_next(request)
+
+    duration = time.time() - start_time
+    endpoint = request.url.path
+
+    REQUEST_COUNT.labels(
+        method=request.method,
+        endpoint=endpoint,
+        status=response.status_code
+    ).inc()
+
+    REQUEST_LATENCY.labels(endpoint=endpoint).observe(duration)
+
+    return response
 
 # === CONFIG ===
 CLIENT_ID = os.getenv("CLIENT_ID")
@@ -786,40 +710,47 @@ async def on_startup():
     )
     scheduler.start()
     schedule_operations()
-    
-    # Update metrics - Set up=1 for health check
-    up.labels(job='NHIT_RAMS_api_health').set(1)
-    scheduled_jobs_active.set(len(scheduler.get_jobs()))
 
 @app.on_event("shutdown")
 def on_shutdown():
-    # Mark app as down when shutting down
-    up.labels(job='NHIT_RAMS_api_health').set(0)
     scheduler.shutdown()
 
-# ============================================
-# METRICS ENDPOINT FOR RAILWAY PROMETHEUS
-# ============================================
-@app.get("/metrics")
-async def metrics():
-    """Prometheus metrics endpoint in text format"""
-    return Response(
-        content=generate_latest(REGISTRY),
-        media_type=CONTENT_TYPE_LATEST
-    )
-
-# ============================================
-# HEALTH CHECK ENDPOINT
-# ============================================
+# ------------------------------
+# Health Check Endpoint
+# ------------------------------
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for Railway"""
+    """Health check - always 200 for Railway so container is not stopped"""
     return {
         "status": "healthy",
-        "app_up": 1,
+        "service": "NHIT_RAMS_API",
         "scheduler_running": scheduler.running,
         "active_jobs": len(scheduler.get_jobs())
     }
+
+# ------------------------------
+# Prometheus Metrics Endpoint
+# ------------------------------
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint - accessible without authentication"""
+    try:
+        metrics_data = generate_latest()
+        return Response(
+            content=metrics_data,
+            media_type=CONTENT_TYPE_LATEST,
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0"
+            }
+        )
+    except Exception as e:
+        print(f"Error generating metrics: {e}")
+        return Response(
+            content=f"Error generating metrics: {str(e)}",
+            status_code=500
+        )
 
 # Pydantic models
 class BaseFilter(BaseModel):
@@ -1403,7 +1334,6 @@ def get_projects_dates(
 @app.post("/refresh-cache-dash")
 def refresh_cache():
     cache.clear()
-    cache_entries.labels(cache_type='main').set(0)
     return {"message": "Cache cleared and will reload on next request"}
 
 
@@ -1413,8 +1343,6 @@ async def last_run():
 
 @app.post("/append_distressReported_excel/")
 def append_excel(record: DistressRecord):
-    excel_operations_total.labels(operation='distress_append').inc()
-    
     token = get_access_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
@@ -1565,8 +1493,6 @@ def append_excel(record: DistressRecord):
 # ===========================
 @app.post("/append_inventory_excel/")
 def append_inventory_excel(record: InventoryRecord):
-    excel_operations_total.labels(operation='inventory_append').inc()
-    
     token = get_access_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
@@ -1663,14 +1589,10 @@ async def process_image(file: UploadFile = File(...)):
         fname = file.filename
  
         if not validate_filename(fname):
-            errors_total.labels(error_type='invalid_filename').inc()
             return {"status": "error",
                     "message": "Invalid filename. Must end in _RHS_L1, _RHS_L2, _LHS_L1, _LHS_L2"}
  
         image_bytes = await file.read()
-        
-        # Track image processing
-        images_processed_total.labels(operation_type='process_image').inc()
  
         df_main = process_image_generate_excels_memory(image_bytes, fname)
  
@@ -1703,7 +1625,6 @@ async def process_image(file: UploadFile = File(...)):
         }
  
     except Exception as e:
-        errors_total.labels(error_type='process_image_error').inc()
         return {"status": "error", "message": str(e)}
  
  
@@ -1984,8 +1905,6 @@ async def upload_images(files: List[UploadFile] = File(...)):
  
     # 🔥 CLEAR ALL PREVIOUS DATA FIRST
     reset_cache()
-    
-    images_processed_total.labels(operation_type='upload_images').inc()
  
     for f in files:
         content = await f.read()
@@ -1995,8 +1914,6 @@ async def upload_images(files: List[UploadFile] = File(...)):
                 detail=f"Empty file detected: {f.filename}"
             )
         CACHE["images"].append((f.filename, content))
-    
-    cache_entries.labels(cache_type='images').set(len(CACHE["images"]))
  
     return {
         "status": "Previous data cleared. New images uploaded successfully.",
