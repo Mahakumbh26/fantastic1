@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends, Query,Path, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -18,9 +18,7 @@ import numpy as np
 import collections,cv2
 import html
 from fastapi.concurrency import run_in_threadpool
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST, REGISTRY
-from prometheus_fastapi_instrumentator import Instrumentator
-from starlette.responses import Response
+from prometheus_client import Counter, Histogram, Gauge, Info, generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry, REGISTRY
  
 
 class Settings(BaseSettings):
@@ -50,55 +48,67 @@ settings = Settings()
 
 app = FastAPI()
 
-# Prometheus metrics
-REQUEST_COUNT = Counter(
-    'app_requests_total',
-    'Total number of requests',
+# ============================================
+# PROMETHEUS METRICS FOR RAILWAY
+# ============================================
+
+# Application health status (1 = up, 0 = down)
+app_up = Gauge('app_up', 'Application is running (1 = up, 0 = down)')
+app_up.set(1)  # Set to 1 when app starts
+
+# Application info
+app_info = Info('app_info', 'Application information')
+app_info.info({
+    'version': '1.0.0',
+    'name': 'Railway Distress Analysis API'
+})
+
+# HTTP request metrics
+http_requests_total = Counter(
+    'http_requests_total',
+    'Total HTTP requests',
     ['method', 'endpoint', 'status']
 )
 
-REQUEST_DURATION = Histogram(
-    'app_request_duration_seconds',
-    'Request duration in seconds',
+http_request_duration_seconds = Histogram(
+    'http_request_duration_seconds',
+    'HTTP request duration in seconds',
     ['method', 'endpoint']
 )
 
-IMAGE_PROCESSING_COUNT = Counter(
-    'image_processing_total',
+# Image processing metrics
+images_processed_total = Counter(
+    'images_processed_total',
     'Total number of images processed',
-    ['operation']
-)
-
-EXCEL_OPERATIONS = Counter(
-    'excel_operations_total',
-    'Total number of Excel operations',
     ['operation_type']
 )
 
-CACHE_SIZE = Gauge(
-    'cache_size_bytes',
-    'Current cache size',
-    ['cache_type']
+# Excel operations metrics
+excel_operations_total = Counter(
+    'excel_operations_total',
+    'Total Excel operations',
+    ['operation']
 )
 
-ACTIVE_JOBS = Gauge(
-    'active_scheduled_jobs',
+# Scheduler metrics
+scheduled_jobs_active = Gauge(
+    'scheduled_jobs_active',
     'Number of active scheduled jobs'
 )
 
-# Initialize Prometheus instrumentator
-instrumentator = Instrumentator(
-    should_group_status_codes=False,
-    should_ignore_untemplated=True,
-    should_respect_env_var=True,
-    should_instrument_requests_inprogress=True,
-    excluded_handlers=["/metrics"],
-    env_var_name="ENABLE_METRICS",
-    inprogress_name="app_requests_inprogress",
-    inprogress_labels=True,
+# Cache metrics
+cache_entries = Gauge(
+    'cache_entries',
+    'Number of entries in cache',
+    ['cache_type']
 )
 
-instrumentator.instrument(app)
+# Error metrics
+errors_total = Counter(
+    'errors_total',
+    'Total number of errors',
+    ['error_type']
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -724,29 +734,38 @@ async def on_startup():
     scheduler.start()
     schedule_operations()
     
-    # Expose metrics endpoint
-    instrumentator.expose(app)
-    
-    # Update active jobs gauge
-    ACTIVE_JOBS.set(len(scheduler.get_jobs()))
+    # Update metrics
+    app_up.set(1)
+    scheduled_jobs_active.set(len(scheduler.get_jobs()))
 
 @app.on_event("shutdown")
 def on_shutdown():
+    app_up.set(0)  # Mark app as down
     scheduler.shutdown()
 
-# Health check endpoint for Railway
+# ============================================
+# METRICS ENDPOINT FOR RAILWAY PROMETHEUS
+# ============================================
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint in text format"""
+    return Response(
+        content=generate_latest(REGISTRY),
+        media_type=CONTENT_TYPE_LATEST
+    )
+
+# ============================================
+# HEALTH CHECK ENDPOINT
+# ============================================
 @app.get("/health")
 async def health_check():
+    """Health check endpoint for Railway"""
     return {
         "status": "healthy",
+        "app_up": 1,
         "scheduler_running": scheduler.running,
         "active_jobs": len(scheduler.get_jobs())
     }
-
-# Manual metrics endpoint (backup)
-@app.get("/metrics")
-async def metrics():
-    return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
 # Pydantic models
 class BaseFilter(BaseModel):
@@ -1330,6 +1349,7 @@ def get_projects_dates(
 @app.post("/refresh-cache-dash")
 def refresh_cache():
     cache.clear()
+    cache_entries.labels(cache_type='main').set(0)
     return {"message": "Cache cleared and will reload on next request"}
 
 
@@ -1339,7 +1359,7 @@ async def last_run():
 
 @app.post("/append_distressReported_excel/")
 def append_excel(record: DistressRecord):
-    EXCEL_OPERATIONS.labels(operation_type='distress_append').inc()
+    excel_operations_total.labels(operation='distress_append').inc()
     
     token = get_access_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -1491,6 +1511,8 @@ def append_excel(record: DistressRecord):
 # ===========================
 @app.post("/append_inventory_excel/")
 def append_inventory_excel(record: InventoryRecord):
+    excel_operations_total.labels(operation='inventory_append').inc()
+    
     token = get_access_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
@@ -1582,18 +1604,20 @@ def append_inventory_excel(record: InventoryRecord):
 async def process_image(file: UploadFile = File(...)):
  
     global SESSION_MAIN_EXCEL, SESSION_MAIN_NAME
+    start_time = time.time()
  
     try:
         fname = file.filename
  
         if not validate_filename(fname):
+            errors_total.labels(error_type='invalid_filename').inc()
             return {"status": "error",
                     "message": "Invalid filename. Must end in _RHS_L1, _RHS_L2, _LHS_L1, _LHS_L2"}
  
         image_bytes = await file.read()
         
         # Track image processing
-        IMAGE_PROCESSING_COUNT.labels(operation='process_image').inc()
+        images_processed_total.labels(operation_type='process_image').inc()
  
         df_main = process_image_generate_excels_memory(image_bytes, fname)
  
@@ -1617,6 +1641,11 @@ async def process_image(file: UploadFile = File(...)):
                 "total_length_m": float(cls_df["Length(M)"].sum()),
                 "total_width_mm": float(cls_df["Width(MM)"].sum())
             }
+        
+        # Track metrics
+        duration = time.time() - start_time
+        http_request_duration_seconds.labels(method='POST', endpoint='/process_image').observe(duration)
+        http_requests_total.labels(method='POST', endpoint='/process_image', status='200').inc()
  
         return {
             "status": "success",
@@ -1626,6 +1655,8 @@ async def process_image(file: UploadFile = File(...)):
         }
  
     except Exception as e:
+        errors_total.labels(error_type='process_image_error').inc()
+        http_requests_total.labels(method='POST', endpoint='/process_image', status='500').inc()
         return {"status": "error", "message": str(e)}
  
  
@@ -1906,6 +1937,8 @@ async def upload_images(files: List[UploadFile] = File(...)):
  
     # 🔥 CLEAR ALL PREVIOUS DATA FIRST
     reset_cache()
+    
+    images_processed_total.labels(operation_type='upload_images').inc()
  
     for f in files:
         content = await f.read()
@@ -1915,6 +1948,8 @@ async def upload_images(files: List[UploadFile] = File(...)):
                 detail=f"Empty file detected: {f.filename}"
             )
         CACHE["images"].append((f.filename, content))
+    
+    cache_entries.labels(cache_type='images').set(len(CACHE["images"]))
  
     return {
         "status": "Previous data cleared. New images uploaded successfully.",
