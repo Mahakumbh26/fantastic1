@@ -55,7 +55,6 @@ app = FastAPI()
 # Application health status (1 = up, 0 = down)
 # This is used by alert: NHITRAMSAPIDown
 up = Gauge('up', 'Application is running (1 = up, 0 = down)', ['job'])
-up.labels(job='NHIT_RAMS_api_health').set(1)  # Set to 1 when app starts
 
 # Application info
 app_info = Info('app_info', 'Application information')
@@ -112,6 +111,10 @@ errors_total = Counter(
     'Total number of errors',
     ['error_type']
 )
+
+# Initialize metrics immediately (so they appear in /metrics even before first request)
+up.labels(job='NHIT_RAMS_api_health').set(1)
+scheduled_jobs_active.set(0)  # Will be updated on startup
 
 app.add_middleware(
     CORSMiddleware,
